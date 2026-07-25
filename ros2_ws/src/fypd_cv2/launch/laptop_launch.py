@@ -98,6 +98,7 @@ def generate_launch_description():
             ],
             remappings=[
                 ('/scan', '/scan_slam'),
+                ('/imu', '/imu/data'),
             ],
         ),
 

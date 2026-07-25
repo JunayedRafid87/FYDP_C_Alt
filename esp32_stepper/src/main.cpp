@@ -96,6 +96,10 @@ void loop() {
     bool motionDetected = false;
     double qw = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
 
+    // Gyro in rad/s and raw accelerometer in m/s² (with gravity) for Cartographer
+    double gx = 0.0, gy = 0.0, gz = 0.0;
+    double ax = 0.0, ay = 0.0, az = 9.81;
+
     if (bnoFound) {
         // Read IMU Orientation
         imu::Quaternion quat = bno.getQuat();
@@ -104,10 +108,23 @@ void loop() {
         qy = quat.y();
         qz = quat.z();
 
-        // Read sensor vectors to check for physical base movement
+        // Read sensor vectors
         imu::Vector<3> gyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
         imu::Vector<3> linear_acc = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+        // Raw accelerometer WITH gravity — Cartographer needs this to find "up"
+        imu::Vector<3> raw_acc = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
 
+        // Store gyro in rad/s (BNO055 IMUPLUS reports deg/s for gyroscope)
+        gx = gyro.x() * DEG_TO_RAD;
+        gy = gyro.y() * DEG_TO_RAD;
+        gz = gyro.z() * DEG_TO_RAD;
+
+        // Store raw accel in m/s² (already in m/s² from BNO055)
+        ax = raw_acc.x();
+        ay = raw_acc.y();
+        az = raw_acc.z();
+
+        // Motion detection uses gravity-compensated linear accel + gyro magnitude
         double gyro_mag = sqrt(gyro.x()*gyro.x() + gyro.y()*gyro.y() + gyro.z()*gyro.z());
         double acc_mag = sqrt(linear_acc.x()*linear_acc.x() + linear_acc.y()*linear_acc.y() + linear_acc.z()*linear_acc.z());
 
@@ -216,6 +233,18 @@ void loop() {
         printBoth(qx); printBoth(",");
         printBoth(qy); printBoth(",");
         printlnBoth(qz);
+
+        // Gyroscope angular velocity in rad/s (for Cartographer pose extrapolation)
+        printBoth("GYRO:");
+        printBoth(gx); printBoth(",");
+        printBoth(gy); printBoth(",");
+        printlnBoth(gz);
+
+        // Raw accelerometer in m/s² WITH gravity (for Cartographer gravity detection)
+        printBoth("ACCEL:");
+        printBoth(ax); printBoth(",");
+        printBoth(ay); printBoth(",");
+        printlnBoth(az);
 
         printBoth("STEP:");
         printlnBoth(stepperAngle);

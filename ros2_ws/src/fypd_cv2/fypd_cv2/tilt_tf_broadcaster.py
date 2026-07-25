@@ -44,6 +44,11 @@ class HardwareInterfaceNode(Node):
         self.last_roll = 0.0
         self.last_pitch = 0.0
 
+        # Buffered gyro (rad/s) and raw accelerometer (m/s², with gravity)
+        # Updated from GYRO: and ACCEL: serial lines, consumed by _handle_imu
+        self.gyro = (0.0, 0.0, 0.0)
+        self.accel = (0.0, 0.0, 9.81)
+
         # TF broadcaster for base_link ➔ base_link_stabilized
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -95,6 +100,12 @@ class HardwareInterfaceNode(Node):
                     
                     if not (math.isnan(qw) or math.isnan(qx) or math.isnan(qy) or math.isnan(qz)):
                         self._handle_imu(qw, qx, qy, qz)
+                elif line.startswith('GYRO:'):
+                    parts = line.split(':')[1].split(',')
+                    self.gyro = (float(parts[0]), float(parts[1]), float(parts[2]))
+                elif line.startswith('ACCEL:'):
+                    parts = line.split(':')[1].split(',')
+                    self.accel = (float(parts[0]), float(parts[1]), float(parts[2]))
                 elif line.startswith('STEP:'):
                     angle_deg = float(line.split(':')[1])
                     self._handle_stepper(angle_deg)
@@ -130,21 +141,43 @@ class HardwareInterfaceNode(Node):
         """Publish /imu/data and broadcast base_link ➔ base_link_stabilized."""
         now_msg = self.get_clock().now().to_msg()
 
-        # 1. Publish standard Imu message
+        # 1. Publish standard Imu message with full sensor data
         imu_msg = Imu()
         imu_msg.header.stamp = now_msg
         imu_msg.header.frame_id = 'base_link'
-        
+
         imu_msg.orientation.w = qw
         imu_msg.orientation.x = qx
         imu_msg.orientation.y = qy
         imu_msg.orientation.z = qz
 
-        # Orientation covariance (very low since it is pre-fused on BNO055)
-        imu_msg.orientation_covariance = [0.001] * 9
-        # No linear accel and angular velocity, set covariance diagonal to -1
-        imu_msg.angular_velocity_covariance = [-1.0] * 9
-        imu_msg.linear_acceleration_covariance = [-1.0] * 9
+        # Angular velocity from BNO055 gyroscope (rad/s)
+        imu_msg.angular_velocity.x = self.gyro[0]
+        imu_msg.angular_velocity.y = self.gyro[1]
+        imu_msg.angular_velocity.z = self.gyro[2]
+
+        # Raw linear acceleration WITH gravity (m/s²) — Cartographer needs
+        # gravity present so it can determine which way is "up"
+        imu_msg.linear_acceleration.x = self.accel[0]
+        imu_msg.linear_acceleration.y = self.accel[1]
+        imu_msg.linear_acceleration.z = self.accel[2]
+
+        # Covariance matrices (diagonal, small values = high confidence)
+        # BNO055 orientation is pre-fused on-chip
+        imu_msg.orientation_covariance = [
+            0.001, 0.0, 0.0,
+            0.0, 0.001, 0.0,
+            0.0, 0.0, 0.001]
+        # BNO055 gyroscope noise ~0.01 rad/s
+        imu_msg.angular_velocity_covariance = [
+            0.0001, 0.0, 0.0,
+            0.0, 0.0001, 0.0,
+            0.0, 0.0, 0.0001]
+        # BNO055 accelerometer noise ~0.06 m/s²
+        imu_msg.linear_acceleration_covariance = [
+            0.004, 0.0, 0.0,
+            0.0, 0.004, 0.0,
+            0.0, 0.0, 0.004]
 
         self.imu_pub.publish(imu_msg)
 

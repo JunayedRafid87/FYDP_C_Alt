@@ -1,4 +1,4 @@
--- Cartographer 2D — FYDP Cv2
+-- Cartographer 2D — FYDP Cv2 (v5.2: Enhanced Loop Closure for Reverse Drift)
 --
 -- TF ownership is split three ways and nothing overlaps:
 --   map  -> odom                  : this node        (provide_odom_frame = false,
@@ -48,9 +48,21 @@ TRAJECTORY_BUILDER_2D.min_range = 0.15
 TRAJECTORY_BUILDER_2D.max_range = 12.0
 TRAJECTORY_BUILDER_2D.missing_data_ray_length = 5.
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.15
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(25.0)
+
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.1)
 
-POSE_GRAPH.constraint_builder.min_score = 0.65
-POSE_GRAPH.constraint_builder.global_localization_min_score = 0.70
+-- Pose graph optimization & loop closure tuning
+POSE_GRAPH.optimize_every_n_nodes = 35
+
+-- Lower thresholds to recognize previously mapped rooms during reverse traversal
+POSE_GRAPH.constraint_builder.min_score = 0.55
+POSE_GRAPH.constraint_builder.global_localization_min_score = 0.60
+POSE_GRAPH.constraint_builder.sampling_ratio = 0.3
+POSE_GRAPH.constraint_builder.max_constraint_distance = 15.0
+
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 7.0
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(30.0)
 
 return options

@@ -1,0 +1,17 @@
+# ROS 2 Build files
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# PlatformIO Build files
+esp32_stepper/.pio/
+esp32_stepper/.clangd/
+
+# Python caching
+**/__pycache__/
+**/*.pyc
+
+# Local files
+map.pcd
+*.log
+.DS_Store

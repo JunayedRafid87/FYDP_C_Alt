@@ -109,10 +109,10 @@ scans during the sweep. So RF2O runs with `publish_tf:=false` and publishes to
 Set `export ROS_DOMAIN_ID=42` and `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` in
 `~/.bashrc` on **both** machines first.
 
-### Step 1: RDK X5 (SSH, headless)
+### Step 1: RDK X5 (Headless Terminal)
 Connect the RPLiDAR C1 and ESP32-S3 to the RDK's USB ports, then:
 ```bash
-cd ~/fydpv2/ros2_ws
+cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch fypd_cv2 rover_launch.py \

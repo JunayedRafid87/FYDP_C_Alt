@@ -44,9 +44,7 @@ Visualization Manager:
       Style: Points
       Size (Pixels): 2
       Decay Time: 0
-      Color Transformer: AxisColor
-      Axis: Z
-      Autocompute Intensity Bounds: true
+      Color Transformer: RGB8
       Use Fixed Frame: true
     - Class: rviz_default_plugins/PointCloud2
       Name: Live Scan Slice

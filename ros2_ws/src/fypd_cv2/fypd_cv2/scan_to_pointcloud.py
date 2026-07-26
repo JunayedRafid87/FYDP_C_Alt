@@ -3,13 +3,15 @@
 Scan to PointCloud2 Converter & Map Accumulator — FYDP Cv2
 =========================================================
 Converts 2D LaserScan messages into 3D PointCloud2 using dynamic TF transforms,
-and accumulates them into a persistent 3D voxel map only during scanning sweeps.
+filters points against Cartographer's 2D OccupancyGrid floorplan, and calculates
+a multi-axis spectrum color gradient for maximum visual clarity in RViz.
 """
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
+from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
@@ -17,6 +19,8 @@ from laser_geometry import LaserProjection
 import tf2_sensor_msgs
 import sensor_msgs_py.point_cloud2 as pc2
 import numpy as np
+import math
+import struct
 import os
 import time
 
@@ -28,14 +32,21 @@ class ScanToPointCloud(Node):
         self.declare_parameter('target_frame', 'map')
         self.target_frame = self.get_parameter('target_frame').value
 
-        # Parameters for point cloud accumulation
+        # Parameters for point cloud accumulation & filtering
         self.declare_parameter('voxel_size', 0.02)
         self.declare_parameter('invert_z', False)
+        self.declare_parameter('filter_by_occupancy', True)
+        self.declare_parameter('max_occupancy_threshold', 50)  # <= 50 is free space
         self.declare_parameter('save_dir', os.path.expanduser('~/fydp_maps'))
 
         self.voxel_size = self.get_parameter('voxel_size').value
         self.invert_z = self.get_parameter('invert_z').value
+        self.filter_by_occupancy = self.get_parameter('filter_by_occupancy').value
+        self.max_occupancy_threshold = self.get_parameter('max_occupancy_threshold').value
         self.save_dir = self.get_parameter('save_dir').value
+
+        # Occupancy map data buffer
+        self.occupancy_grid = None
 
         # TF2 buffer and listener
         self.tf_buffer = Buffer()
@@ -45,17 +56,11 @@ class ScanToPointCloud(Node):
         self.laser_projector = LaserProjection()
 
         # Storage for voxel-filtered accumulated map points
-        # key: (vx, vy, vz), value: [x, y, z, intensity]
+        # key: (vx, vy, vz), value: [x, y, z, rgb_packed, intensity]
         self.map_points = {}
         self.scan_count = 0
 
-        # Subscriptions.
-        # Depth 1 + best-effort on /scan is deliberate. Projecting and voxelising is
-        # heavier than the 15 Hz scan rate on a bad frame, and with a deep queue the
-        # node never recovers: it works through a backlog whose timestamps fall out of
-        # the back of the TF cache, so every lookup fails and *nothing* is mapped.
-        # Dropping a stale scan costs one slice of a 30 s sweep; falling behind costs
-        # the whole sweep.
+        # Subscriptions
         scan_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -65,6 +70,8 @@ class ScanToPointCloud(Node):
             LaserScan, '/scan', self.scan_callback, scan_qos)
         self.state_sub = self.create_subscription(
             String, '/scan_state', self.state_callback, 10)
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, '/map', self.occupancy_callback, 10)
 
         # Publishers
         self.cloud_pub = self.create_publisher(
@@ -75,28 +82,31 @@ class ScanToPointCloud(Node):
         # State tracking
         self.current_state = "MOVING"
 
-        # Service to clear/delete the accumulated map
+        # Services
         self.clear_service = self.create_service(
             Trigger, '/clear_map', self.clear_map_callback)
-
-        # Service to dump the accumulated map to a .pcd file on disk
         self.save_service = self.create_service(
             Trigger, '/save_map', self.save_map_callback)
 
-        # Define PointCloud2 fields
+        # Define PointCloud2 fields (x, y, z, rgb, intensity)
         self.map_fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
             PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='intensity', offset=16, datatype=PointField.FLOAT32, count=1),
         ]
 
-        # Republish the accumulated map at a steady 1 Hz, independent of scan rate
+        # Timer to publish 3D map at steady 1 Hz
         self.map_timer = self.create_timer(1.0, self.publish_map)
 
-        self.get_logger().info('ScanToPointCloud node started')
+        self.get_logger().info('ScanToPointCloud node started (v7.1 Enhanced Filter & Color Gradient)')
         self.get_logger().info(f'Projecting scans into target frame: {self.target_frame}')
-        self.get_logger().info(f'Voxel filter resolution set to: {self.voxel_size}m')
+        self.get_logger().info(f'Voxel resolution: {self.voxel_size}m | 2D Occupancy Filter: {self.filter_by_occupancy}')
+
+    def occupancy_callback(self, msg):
+        """Buffer latest 2D OccupancyGrid from Cartographer."""
+        self.occupancy_grid = msg
 
     def clear_map_callback(self, request, response):
         self.map_points = {}
@@ -105,7 +115,7 @@ class ScanToPointCloud(Node):
         return response
 
     def save_map_callback(self, request, response):
-        """Write the accumulated map to an ASCII .pcd (readable by CloudCompare/MeshLab)."""
+        """Write the accumulated map to an ASCII .pcd file."""
         if not self.map_points:
             response.success = False
             response.message = "Nothing to save — the 3D map is empty."
@@ -128,8 +138,9 @@ class ScanToPointCloud(Node):
                 f.write('VIEWPOINT 0 0 0 1 0 0 0\n')
                 f.write(f'POINTS {len(points)}\n')
                 f.write('DATA ascii\n')
-                for x, y, z, i in points:
-                    f.write(f'{x:.4f} {y:.4f} {z:.4f} {i:.2f}\n')
+                for p in points:
+                    # p is [x, y, z, rgb_packed, intensity]
+                    f.write(f'{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {p[4]:.2f}\n')
         except OSError as e:
             response.success = False
             response.message = f"Failed to write map: {e}"
@@ -145,21 +156,11 @@ class ScanToPointCloud(Node):
         self.current_state = msg.data.upper()
 
     def _lookup(self, frame_id, stamp):
-        """Resolve frame_id -> target_frame, preferring the scan's own timestamp.
-
-        Both lookups are non-blocking on purpose. This callback runs on a
-        single-threaded executor, so a blocking tf timeout stalls the very
-        executor that feeds /tf into the buffer: the node cannot catch up, the
-        subscription queue backs up, and every subsequent scan is looked up
-        further in the past until nothing resolves at all.
-        """
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame, frame_id, stamp)
         except Exception:
             pass
-        # Fall back to the newest transform available. During a sweep the tilt
-        # moves fast, so this is only worth doing to keep the live view alive.
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame, frame_id, rclpy.time.Time())
@@ -169,22 +170,111 @@ class ScanToPointCloud(Node):
                 throttle_duration_sec=2.0)
             return None
 
+    def _filter_points_by_occupancy(self, pts):
+        """Filter 3D points to keep only those within mapped 2D floorplan space."""
+        if not self.filter_by_occupancy or self.occupancy_grid is None:
+            return pts
+
+        grid = self.occupancy_grid
+        info = grid.info
+        origin_x = info.origin.position.x
+        origin_y = info.origin.position.y
+        res = info.resolution
+        width = info.width
+        height = info.height
+        data = np.array(grid.data, dtype=np.int8)
+
+        # Convert world (x, y) coordinates to grid indices
+        gx = np.floor((pts[:, 0] - origin_x) / res).astype(np.int32)
+        gy = np.floor((pts[:, 1] - origin_y) / res).astype(np.int32)
+
+        # Mask points within grid bounds
+        valid_bounds = (gx >= 0) & (gx < width) & (gy >= 0) & (gy < height)
+        
+        # Points outside the grid bounds completely are rejected
+        valid_indices = np.where(valid_bounds)[0]
+        if len(valid_indices) == 0:
+            return np.empty((0, pts.shape[1]), dtype=np.float32)
+
+        # Check occupancy cell value
+        cell_idx = gy[valid_indices] * width + gx[valid_indices]
+        cell_vals = data[cell_idx]
+
+        # Free space is 0 to max_occupancy_threshold (default <= 50)
+        # -1 = unknown, >50 = wall
+        free_mask = (cell_vals >= 0) & (cell_vals <= self.max_occupancy_threshold)
+        accepted_indices = valid_indices[free_mask]
+
+        return pts[accepted_indices]
+
+    def _compute_multi_axis_colors(self, pts):
+        """Compute vibrant multi-axis RGB colors and normalized intensity.
+        
+        Uses full 3D position vector distance dist = sqrt(x^2 + y^2 + z^2)
+        and axis projection to create a smooth rainbow gradient along movement.
+        """
+        if pts.shape[0] == 0:
+            return np.empty((0, 5), dtype=np.float32)
+
+        x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+
+        # Calculate continuous 3D multi-axis distance norm
+        dist = np.sqrt(x**2 + y**2 + z**2)
+        
+        # Normalized hue cycle (0.0 to 1.0)
+        hue = (dist * 1.5) % 1.0
+
+        # HSV to RGB spectrum calculation
+        h6 = hue * 6.0
+        i = np.floor(h6).astype(int)
+        f = h6 - i
+        q = 1.0 - f
+
+        r = np.zeros_like(hue)
+        g = np.zeros_like(hue)
+        b = np.zeros_like(hue)
+
+        # Vectorized color mapping across spectrum
+        idx = (i % 6 == 0)
+        r[idx], g[idx], b[idx] = 1.0, f[idx], 0.0
+        idx = (i % 6 == 1)
+        r[idx], g[idx], b[idx] = q[idx], 1.0, 0.0
+        idx = (i % 6 == 2)
+        r[idx], g[idx], b[idx] = 0.0, 1.0, f[idx]
+        idx = (i % 6 == 3)
+        r[idx], g[idx], b[idx] = 0.0, q[idx], 1.0
+        idx = (i % 6 == 4)
+        r[idx], g[idx], b[idx] = f[idx], 0.0, 1.0
+        idx = (i % 6 == 5)
+        r[idx], g[idx], b[idx] = 1.0, 0.0, q[idx]
+
+        r_int = (r * 255).astype(np.uint32)
+        g_int = (g * 255).astype(np.uint32)
+        b_int = (b * 255).astype(np.uint32)
+
+        # Pack RGB into float32 (standard ROS PointCloud2 format)
+        rgb_packed = (r_int << 16) | (g_int << 8) | b_int
+        rgb_float = rgb_packed.view(np.float32)
+
+        out = np.zeros((pts.shape[0], 5), dtype=np.float32)
+        out[:, 0] = x
+        out[:, 1] = y
+        out[:, 2] = z
+        out[:, 3] = rgb_float
+        out[:, 4] = dist  # intensity field
+
+        return out
+
     def scan_callback(self, scan_msg):
         try:
-            # 1. Project the LaserScan into a PointCloud2 in its own frame (e.g. 'laser')
             cloud_in_laser_frame = self.laser_projector.projectLaser(scan_msg)
-
-            # 2. Lookup the transform from the laser frame to the target frame (typically 'map')
             transform = self._lookup(scan_msg.header.frame_id, scan_msg.header.stamp)
             if transform is None:
                 return
 
-            # 3. Transform the PointCloud2 into the target frame (resolving IMU + stepper tilt + SLAM pose)
             cloud_in_target_frame = tf2_sensor_msgs.do_transform_cloud(
                 cloud_in_laser_frame, transform)
 
-            # laser_geometry only emits an intensity field when the driver populated
-            # scan.intensities. Ask for what is actually there, not what we hope for.
             available = {f.name for f in cloud_in_target_frame.fields}
             has_intensity = 'intensity' in available
             names = ['x', 'y', 'z', 'intensity'] if has_intensity else ['x', 'y', 'z']
@@ -194,23 +284,26 @@ class ScanToPointCloud(Node):
             if raw.size == 0:
                 return
 
-            # Pack into a contiguous (N, 4) xyz+intensity block
-            pts = np.zeros((raw.shape[0], 4), dtype=np.float32)
+            pts = np.zeros((raw.shape[0], 3), dtype=np.float32)
             pts[:, :3] = raw[:, :3]
-            if has_intensity:
-                pts[:, 3] = raw[:, 3]
             if self.invert_z:
                 pts[:, 2] *= -1.0
 
-            # Live single-scan slice for the real-time view
-            self.cloud_pub.publish(self._pack_cloud(pts))
+            # 1. Filter points against 2D OccupancyGrid floorplan
+            filtered_pts = self._filter_points_by_occupancy(pts)
+            if filtered_pts.shape[0] == 0:
+                return
 
-            # 4. Accumulate points into the 3D map ONLY during stationary active sweeps (SCANNING state)
+            # 2. Compute multi-axis dynamic RGB color gradient
+            colored_pts = self._compute_multi_axis_colors(filtered_pts)
+
+            # Live single-scan slice
+            self.cloud_pub.publish(self._pack_cloud(colored_pts))
+
+            # 3. Accumulate points into 3D map during SCANNING state
             if self.current_state == "SCANNING":
-                # floor, not int(): truncation toward zero makes a double-width
-                # voxel straddling the origin on every axis.
-                keys = np.floor(pts[:, :3] / self.voxel_size).astype(np.int32)
-                for key, p in zip(map(tuple, keys.tolist()), pts):
+                keys = np.floor(colored_pts[:, :3] / self.voxel_size).astype(np.int32)
+                for key, p in zip(map(tuple, keys.tolist()), colored_pts):
                     self.map_points[key] = p
 
             self.scan_count += 1
@@ -220,13 +313,6 @@ class ScanToPointCloud(Node):
                 f'Could not transform/accumulate scan: {e}', throttle_duration_sec=2.0)
 
     def _pack_cloud(self, pts):
-        """Build a PointCloud2 straight from an (N, 4) float32 block.
-
-        pc2.create_cloud walks the array in Python and struct-packs point by point,
-        which is the single most expensive thing in this node once the map is large.
-        The layout here is already exactly what the message wants, so one tobytes()
-        does the whole buffer.
-        """
         msg = PointCloud2()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.target_frame
@@ -234,19 +320,13 @@ class ScanToPointCloud(Node):
         msg.width = pts.shape[0]
         msg.fields = self.map_fields
         msg.is_bigendian = False
-        msg.point_step = 16
-        msg.row_step = 16 * msg.width
+        msg.point_step = 20  # 5 float32 fields = 20 bytes
+        msg.row_step = 20 * msg.width
         msg.is_dense = True
         msg.data = np.ascontiguousarray(pts, dtype=np.float32).tobytes()
         return msg
 
     def publish_map(self):
-        """Publish the accumulated map on a timer, not per scan.
-
-        A 30 s sweep accumulates well over 100k voxels. Re-serialising all of them
-        inside the scan callback grows without bound and eventually starves the scan
-        path, so this runs on its own timer.
-        """
         if not self.map_points:
             return
         try:

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Scan to PointCloud2 Converter & Map Accumulator — FYDP Cv2
-=========================================================
+Scan to PointCloud2 Converter & Map Accumulator — FYDP Cv2 (v7.2)
+=================================================================
 Converts 2D LaserScan messages into 3D PointCloud2 using dynamic TF transforms,
 filters points against Cartographer's 2D OccupancyGrid floorplan, and calculates
-a multi-axis spectrum color gradient for maximum visual clarity in RViz.
+an axis-specific color palette blend (Z: Blue->Green, X: Red->Purple, Y: Orange->Yellow)
+for maximum visual clarity in RViz.
 """
 
 import rclpy
@@ -19,8 +20,6 @@ from laser_geometry import LaserProjection
 import tf2_sensor_msgs
 import sensor_msgs_py.point_cloud2 as pc2
 import numpy as np
-import math
-import struct
 import os
 import time
 
@@ -100,9 +99,8 @@ class ScanToPointCloud(Node):
         # Timer to publish 3D map at steady 1 Hz
         self.map_timer = self.create_timer(1.0, self.publish_map)
 
-        self.get_logger().info('ScanToPointCloud node started (v7.1 Enhanced Filter & Color Gradient)')
-        self.get_logger().info(f'Projecting scans into target frame: {self.target_frame}')
-        self.get_logger().info(f'Voxel resolution: {self.voxel_size}m | 2D Occupancy Filter: {self.filter_by_occupancy}')
+        self.get_logger().info('ScanToPointCloud node started (v7.2 Axis-Specific Color Palettes)')
+        self.get_logger().info(f'Target frame: {self.target_frame} | Voxel: {self.voxel_size}m')
 
     def occupancy_callback(self, msg):
         """Buffer latest 2D OccupancyGrid from Cartographer."""
@@ -139,7 +137,6 @@ class ScanToPointCloud(Node):
                 f.write(f'POINTS {len(points)}\n')
                 f.write('DATA ascii\n')
                 for p in points:
-                    # p is [x, y, z, rgb_packed, intensity]
                     f.write(f'{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {p[4]:.2f}\n')
         except OSError as e:
             response.success = False
@@ -184,76 +181,64 @@ class ScanToPointCloud(Node):
         height = info.height
         data = np.array(grid.data, dtype=np.int8)
 
-        # Convert world (x, y) coordinates to grid indices
         gx = np.floor((pts[:, 0] - origin_x) / res).astype(np.int32)
         gy = np.floor((pts[:, 1] - origin_y) / res).astype(np.int32)
 
-        # Mask points within grid bounds
         valid_bounds = (gx >= 0) & (gx < width) & (gy >= 0) & (gy < height)
-        
-        # Points outside the grid bounds completely are rejected
         valid_indices = np.where(valid_bounds)[0]
         if len(valid_indices) == 0:
             return np.empty((0, pts.shape[1]), dtype=np.float32)
 
-        # Check occupancy cell value
         cell_idx = gy[valid_indices] * width + gx[valid_indices]
         cell_vals = data[cell_idx]
 
-        # Free space is 0 to max_occupancy_threshold (default <= 50)
-        # -1 = unknown, >50 = wall
         free_mask = (cell_vals >= 0) & (cell_vals <= self.max_occupancy_threshold)
         accepted_indices = valid_indices[free_mask]
 
         return pts[accepted_indices]
 
-    def _compute_multi_axis_colors(self, pts):
-        """Compute vibrant multi-axis RGB colors and normalized intensity.
-        
-        Uses full 3D position vector distance dist = sqrt(x^2 + y^2 + z^2)
-        and axis projection to create a smooth rainbow gradient along movement.
+    def _compute_axis_specific_colors(self, pts):
+        """Compute RGB colors based on your exact axis palette specifications:
+        - Z-Axis (Height): Blue (0,0,255) -> Green (0,255,0)
+        - X-Axis (Depth): Red (255,0,0) -> Purple (128,0,128)
+        - Y-Axis (Lateral): Orange (255,140,0) -> Yellow (255,255,0)
         """
         if pts.shape[0] == 0:
             return np.empty((0, 5), dtype=np.float32)
 
         x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
 
-        # Calculate continuous 3D multi-axis distance norm
-        dist = np.sqrt(x**2 + y**2 + z**2)
-        
-        # Normalized hue cycle (0.0 to 1.0)
-        hue = (dist * 1.5) % 1.0
+        # Normalized factor along Z-axis (height: -1.0m to +1.0m)
+        t_z = np.clip((z + 0.5) / 1.5, 0.0, 1.0)
+        # Z-color: Blue (0, 0, 255) -> Green (0, 255, 0)
+        z_r = np.zeros_like(z)
+        z_g = 255.0 * t_z
+        z_b = 255.0 * (1.0 - t_z)
 
-        # HSV to RGB spectrum calculation
-        h6 = hue * 6.0
-        i = np.floor(h6).astype(int)
-        f = h6 - i
-        q = 1.0 - f
+        # Normalized factor along X-axis (depth/forward)
+        t_x = 0.5 + 0.5 * np.sin(x * 0.8)
+        # X-color: Red (255, 0, 0) -> Purple (128, 0, 128)
+        x_r = 255.0 - 127.0 * t_x
+        x_g = np.zeros_like(x)
+        x_b = 128.0 * t_x
 
-        r = np.zeros_like(hue)
-        g = np.zeros_like(hue)
-        b = np.zeros_like(hue)
+        # Normalized factor along Y-axis (lateral/side)
+        t_y = 0.5 + 0.5 * np.sin(y * 0.8)
+        # Y-color: Orange (255, 140, 0) -> Yellow (255, 255, 0)
+        y_r = np.full_like(y, 255.0)
+        y_g = 140.0 + 115.0 * t_y
+        y_b = np.zeros_like(y)
 
-        # Vectorized color mapping across spectrum
-        idx = (i % 6 == 0)
-        r[idx], g[idx], b[idx] = 1.0, f[idx], 0.0
-        idx = (i % 6 == 1)
-        r[idx], g[idx], b[idx] = q[idx], 1.0, 0.0
-        idx = (i % 6 == 2)
-        r[idx], g[idx], b[idx] = 0.0, 1.0, f[idx]
-        idx = (i % 6 == 3)
-        r[idx], g[idx], b[idx] = 0.0, q[idx], 1.0
-        idx = (i % 6 == 4)
-        r[idx], g[idx], b[idx] = f[idx], 0.0, 1.0
-        idx = (i % 6 == 5)
-        r[idx], g[idx], b[idx] = 1.0, 0.0, q[idx]
+        # Blend colors based on spatial dominance (Z height vs XY position)
+        blend_z = 0.5
+        blend_xy = 0.5
 
-        r_int = (r * 255).astype(np.uint32)
-        g_int = (g * 255).astype(np.uint32)
-        b_int = (b * 255).astype(np.uint32)
+        r_final = np.clip(blend_z * z_r + blend_xy * (0.5 * x_r + 0.5 * y_r), 0, 255).astype(np.uint32)
+        g_final = np.clip(blend_z * z_g + blend_xy * (0.5 * x_g + 0.5 * y_g), 0, 255).astype(np.uint32)
+        b_final = np.clip(blend_z * z_b + blend_xy * (0.5 * x_b + 0.5 * y_b), 0, 255).astype(np.uint32)
 
         # Pack RGB into float32 (standard ROS PointCloud2 format)
-        rgb_packed = (r_int << 16) | (g_int << 8) | b_int
+        rgb_packed = (r_final << 16) | (g_final << 8) | b_final
         rgb_float = rgb_packed.view(np.float32)
 
         out = np.zeros((pts.shape[0], 5), dtype=np.float32)
@@ -261,7 +246,7 @@ class ScanToPointCloud(Node):
         out[:, 1] = y
         out[:, 2] = z
         out[:, 3] = rgb_float
-        out[:, 4] = dist  # intensity field
+        out[:, 4] = z  # intensity field
 
         return out
 
@@ -294,8 +279,8 @@ class ScanToPointCloud(Node):
             if filtered_pts.shape[0] == 0:
                 return
 
-            # 2. Compute multi-axis dynamic RGB color gradient
-            colored_pts = self._compute_multi_axis_colors(filtered_pts)
+            # 2. Compute axis-specific RGB colors (Z: Blue->Green, X: Red->Purple, Y: Orange->Yellow)
+            colored_pts = self._compute_axis_specific_colors(filtered_pts)
 
             # Live single-scan slice
             self.cloud_pub.publish(self._pack_cloud(colored_pts))

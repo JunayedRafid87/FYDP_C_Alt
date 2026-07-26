@@ -1,14 +1,10 @@
--- Cartographer 2D — FYDP Cv2 (v5.2: Enhanced Loop Closure for Reverse Drift)
+-- Cartographer 2D — FYDP Cv2 (v7.2: Anti-Disorientation Tuning for Revisiting Areas)
 --
 -- TF ownership is split three ways and nothing overlaps:
 --   map  -> odom                  : this node        (provide_odom_frame = false,
 --                                                     published_frame    = "odom")
 --   odom -> base_link             : odom_gate_node   (RF2O, gated on the IMU state)
 --   base_link -> base_link_stabilized -> laser : hardware_interface + robot_state_publisher
---
--- use_odometry consumes /odom, which is the *gated* odometry, not RF2O's raw output.
--- That matters: while the table is stationary the gated odometry reports zero motion,
--- so the pose extrapolator has nothing to integrate and map -> odom holds still.
 
 include "map_builder.lua"
 include "trajectory_builder.lua"
@@ -53,16 +49,27 @@ TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window =
 
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.1)
 
--- Pose graph optimization & loop closure tuning
-POSE_GRAPH.optimize_every_n_nodes = 35
+-- ═══════════════════════════════════════════════════════════════
+-- SUBMAPS — smaller submaps for quicker completion & smooth revisits
+-- ═══════════════════════════════════════════════════════════════
+-- 80 scans per submap prevents local scan matcher confusion when re-entering
+-- old areas, allowing global loop closure to trigger smoothly.
+TRAJECTORY_BUILDER_2D.submaps.num_range_data = 80
 
--- Lower thresholds to recognize previously mapped rooms during reverse traversal
+-- ═══════════════════════════════════════════════════════════════
+-- POSE GRAPH — Robust loop closure for re-entering familiar spaces
+-- ═══════════════════════════════════════════════════════════════
+POSE_GRAPH.optimize_every_n_nodes = 30
+
 POSE_GRAPH.constraint_builder.min_score = 0.55
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.60
-POSE_GRAPH.constraint_builder.sampling_ratio = 0.3
+POSE_GRAPH.constraint_builder.sampling_ratio = 0.4
 POSE_GRAPH.constraint_builder.max_constraint_distance = 15.0
 
 POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 7.0
 POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(30.0)
+
+-- Smooth optimization weights to prevent abrupt map warping when returning to start
+POSE_GRAPH.optimization_problem.huber_scale = 1e2
 
 return options
